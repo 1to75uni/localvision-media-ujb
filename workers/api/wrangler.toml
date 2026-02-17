@@ -1,0 +1,17 @@
+name = "localvision-api-ujb"
+main = "index.js"
+compatibility_date = "2025-12-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "localvision-db"
+database_id = "PUT_YOUR_D1_DATABASE_ID"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "localvision-media-ujb"
+
+[vars]
+R2_PUBLIC_BASE = "https://pub-c2364f607cc54d6d9efbb3d24cfaec29.r2.dev"
+RIGHT_PREFIX = "right/common"
+ONLINE_TTL_SEC = "120"
