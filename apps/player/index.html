@@ -2,26 +2,444 @@
 <html lang="ko">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>LocalVision Player (V1)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LocalVision 7:3 Player (Single Layout)</title>
   <style>
-    html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Apple SD Gothic Neo,sans-serif}
-    .wrap{display:flex;height:100%}
-    .left{flex:7;position:relative;background:#000}
-    .right{flex:3;position:relative;background:#0b0f1a;border-left:1px solid rgba(255,255,255,.08)}
-    .slot{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
-    video,img{width:100%;height:100%;object-fit:cover}
-    .debug{position:fixed;left:10px;bottom:10px;background:rgba(0,0,0,.55);padding:8px 10px;border-radius:10px;font-size:12px;max-width:60vw}
+    html, body { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
+    .wrap { width:100vw; height:100vh; display:flex; }
+    .zone { position:relative; height:100vh; background:#000; overflow:hidden; }
+    .left { width:70vw; }
+    .right { width:30vw; border-left: 3px solid rgba(255,255,255,0.12); }
+
+    /* FULL PANEL: RIGHT가 전체화면으로 확장되는 모드 */
+    body.fullpanel .left { display:none; }
+    body.fullpanel .right { width:100vw; border-left:none; }
+
+    video, img {
+      width:100%; height:100%;
+      object-fit:cover;
+      position:absolute; inset:0;
+      background:#000;
+    }
+
+    .placeholder {
+      position:absolute; inset:0;
+      display:flex; align-items:center; justify-content:center;
+      color:rgba(255,255,255,0.85);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      font-size:18px;
+      background: radial-gradient(circle at 30% 30%, rgba(255,255,255,0.06), rgba(0,0,0,0.9));
+      z-index:5;
+      text-align:center;
+      padding:24px;
+    }
+
+    /* 상단 뱃지: 기본 숨김 → 상단(56px)에 마우스 올리면 표시 */
+    .badgeWrap{
+      position:absolute; top:0; left:0; right:0;
+      height:56px;
+      z-index:12;
+      background:transparent;
+      cursor:default;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .badgeWrap:focus{ outline:none; }
+    .badge {
+      position:absolute; top:10px; left:10px;
+      padding:6px 10px; border-radius:999px;
+      background:rgba(0,0,0,0.45);
+      color:rgba(255,255,255,0.75);
+      font-size:12px;
+      user-select:none;
+
+      /* hidden by default */
+      opacity:0;
+      transform: translateY(-4px);
+      transition: opacity 140ms ease, transform 140ms ease;
+      pointer-events:none;
+    }
+    .badgeWrap:hover .badge,
+    .badgeWrap:active .badge {
+      opacity:1;
+      transform: translateY(0);
+    }
+
+    .overlay {
+      position:absolute; bottom:16px; right:16px;
+      background: rgba(0,0,0,0.55);
+      color:#fff;
+      padding:10px 14px;
+      border-radius:12px;
+      font-size:16px;
+      cursor:pointer;
+      z-index:10;
+      user-select:none;
+      display:none;
+    }
+
+    /* 진단 패널 */
+    .diag {
+      position:fixed; top:0; right:0;
+      width:min(420px, 90vw); height:100vh;
+      background:rgba(0,0,0,0.88);
+      border-left:1px solid rgba(255,255,255,0.15);
+      transform: translateX(100%);
+      transition: transform 180ms ease;
+      z-index: 1250;
+      color:#fff;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      padding:16px;
+      box-sizing:border-box;
+    }
+    .diag.open { transform: translateX(0); }
+    .diag h3 { margin:0 0 12px 0; font-size:16px; }
+    .row { display:flex; justify-content:space-between; gap:12px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.08); }
+    .k { color:rgba(255,255,255,0.65); font-size:13px; }
+    .v { color:rgba(255,255,255,0.95); font-size:13px; text-align:right; word-break:break-all; }
+    .hint {
+      position:fixed; bottom:10px; left:10px;
+      color:rgba(255,255,255,0.35); font-size:12px;
+      z-index:998;
+    }
+
+    /* 숨김 클릭 영역(좌상단) */
+    /* ===== Fully Kiosk/키오스크 모드: 상단 UI 완전 숨김 =====
+       - 목적: Fully Kiosk에서는 hover/focus가 항상 걸려 '우리업체70/지역소식30' 뱃지와 전체화면 버튼이 계속 보이는 현상 제거
+       - 동작: (1) UA가 FullyKiosk로 보이거나 (2) URL에 kiosk=1 이면 숨김
+    */
+    html.kiosk .badgeWrap,
+    html.kiosk .hint,
+    html.kiosk .netDock{
+      display:none !important;
+    }
+
+
+    .diagbtn{
+      padding:10px 12px;
+      border-radius:12px;
+      border:1px solid rgba(255,255,255,0.18);
+      background:rgba(255,255,255,0.08);
+      color:rgba(255,255,255,0.95);
+      font-size:14px;
+      cursor:pointer;
+    }
+    .diagbtn:active{ transform: scale(0.98); }
+    .vBtns{ display:flex; gap:8px; justify-content:flex-end; align-items:center; }
+
+.hotspot {
+      position:fixed; top:0; left:0;
+      width:60px; height:60px;
+      z-index:998;
+      background:transparent;
+    }
+  
+    /* ===== Sleep Mode UI (owner) ===== */
+    .sleep-hotspot{
+      position:fixed; right:0; bottom:0;
+      width:120px; height:120px;
+      z-index:999;
+      background:transparent;
+      touch-action:manipulation;
+      display:none;
+      pointer-events:none;
+    }
+    .sleep-shield{
+      position:fixed; inset:0;
+      z-index:1200;
+      display:none;
+      background:#000;
+      pointer-events:auto; /* block touches while sleeping */
+    }
+    .sleep-shield.on{ display:block; }
+    .sleep-saver{
+      position:absolute; inset:0;
+      display:none;
+      overflow:hidden;
+    }
+    .sleep-shield.saver .sleep-saver{ display:block; }
+    .sleep-saver::before{
+      content:"";
+      position:absolute;
+      width:24px; height:24px;
+      border-radius:999px;
+      background:rgba(255,255,255,0.16);
+      left:10%; top:10%;
+      animation:saverMove 12s linear infinite;
+    }
+    @keyframes saverMove{
+      0%{ transform:translate(0,0); }
+      25%{ transform:translate(70vw,10vh); }
+      50%{ transform:translate(55vw,70vh); }
+      75%{ transform:translate(10vw,55vh); }
+      100%{ transform:translate(0,0); }
+    }
+    .sleep-panel{
+      position:fixed;
+      left:50%; top:50%;
+      transform:translate(-50%,-50%);
+      width:min(720px, 92vw);
+      z-index:1300;
+      background:rgba(18,18,18,0.92);
+      border:1px solid rgba(255,255,255,0.10);
+      border-radius:18px;
+      box-shadow:0 18px 60px rgba(0,0,0,0.55);
+      color:#fff;
+      display:none;
+      font-family: system-ui, -apple-system, "Nanum Gothic", "Pretendard", sans-serif;
+    }
+    .sleep-panel.open{ display:block; }
+    .sp-head{
+      display:flex; align-items:center; justify-content:space-between;
+      padding:16px 18px;
+      border-bottom:1px solid rgba(255,255,255,0.08);
+    }
+    .sp-title{ font-size:18px; font-weight:700; letter-spacing:-0.2px; }
+    .sp-close{
+      background:rgba(255,255,255,0.10);
+      border:1px solid rgba(255,255,255,0.12);
+      color:#fff;
+      border-radius:12px;
+      padding:10px 12px;
+      font-size:14px;
+    }
+    .sp-body{ padding:16px 18px 18px; }
+    .sp-row{
+      display:flex; align-items:center; gap:10px;
+      margin:10px 0;
+      flex-wrap:wrap;
+    }
+    .sp-label{
+      width:64px;
+      color:rgba(255,255,255,0.70);
+      font-size:13px;
+    }
+    .sp-val{
+      min-width:92px;
+      padding:10px 12px;
+      border-radius:12px;
+      background:rgba(255,255,255,0.06);
+      border:1px solid rgba(255,255,255,0.10);
+      font-size:18px;
+      font-weight:800;
+      letter-spacing:0.5px;
+      text-align:center;
+    }
+    .sp-btn{
+      background:rgba(255,255,255,0.10);
+      border:1px solid rgba(255,255,255,0.12);
+      color:#fff;
+      border-radius:12px;
+      padding:10px 12px;
+      font-size:14px;
+      min-width:92px;
+    }
+    .sp-btn.on{
+      outline:2px solid rgba(255,255,255,0.35);
+      background:rgba(255,255,255,0.18);
+    }
+    .sp-adjust .sp-btn{ min-width:110px; }
+    .sp-foot{
+      justify-content:flex-end;
+      margin-top:14px;
+    }
+    .sp-hint{
+      margin-top:10px;
+      font-size:12px;
+      color:rgba(255,255,255,0.55);
+      line-height:1.35;
+    }
+    .sp-btn:focus, .sp-close:focus{
+      outline:2px solid rgba(255,255,255,0.45);
+      outline-offset:2px;
+    }
+    
+  
+    /* network badge (hover to reveal) */
+    .netDock{
+      position:fixed;
+      right:10px;
+      bottom:8px;
+      width:110px;
+      height:18px;
+      z-index:99998;
+      pointer-events:auto;
+      background:transparent;
+    }
+    .netBadge{
+      position:absolute;
+      right:0;
+      bottom:0;
+      padding:2px 8px;
+      border-radius:999px;
+      font-size:11px;
+      letter-spacing:0.2px;
+      color:#fff;
+      background:rgba(0,0,0,0.45);
+      border:1px solid rgba(255,255,255,0.18);
+      opacity:0;
+      transform:translateY(4px);
+      transition:opacity .15s ease, transform .15s ease;
+      user-select:none;
+      pointer-events:none;
+      white-space:nowrap;
+    }
+    .netDock:hover .netBadge,
+    .netDock:focus-within .netBadge{
+      opacity:1;
+      transform:translateY(0);
+    }
+
   </style>
+
+  <script>
+    // ✅ 키오스크(UI 숨김) 모드 감지
+    // - Fully Kiosk Browser에서는 포커스가 자동으로 잡혀 상단 뱃지/버튼이 계속 보일 수 있어, UI를 숨깁니다.
+    // - 조건: (1) URL ?kiosk=1 또는 ?ui=min|0 (2) UA에 Fully 포함 (3) window.fully 인터페이스 감지
+    (function(){
+      try{
+        const root = document.documentElement;
+        const params = new URLSearchParams(location.search);
+        const kioskParam = (params.get("kiosk") || "").toLowerCase();
+        const uiParam = (params.get("ui") || "").toLowerCase();
+
+        const kioskOn = ["1","true","on","yes"].includes(kioskParam)
+          || ["0","off","hide","min","minimal","kiosk"].includes(uiParam);
+
+        const ua = navigator.userAgent || "";
+        const uaFully = /FullyKiosk|Fully Kiosk|FullyKioskBrowser/i.test(ua) || /Fully/i.test(ua);
+
+        const apply = () => {
+          const hasFully = !!window.fully;
+          if (kioskOn || uaFully || hasFully) root.classList.add("kiosk");
+        };
+
+        apply();
+
+        // Fully JS Interface가 뒤늦게 붙는 경우 대비(최대 5초)
+        let tries = 0;
+        const t = setInterval(() => {
+          tries++;
+          if (window.fully) {
+            root.classList.add("kiosk");
+            clearInterval(t);
+          }
+          if (tries > 20) clearInterval(t);
+        }, 250);
+      }catch(e){}
+    })();
+  </script>
+
 </head>
 <body>
   <div class="wrap">
-    <div class="left"><div id="leftSlot" class="slot"></div></div>
-    <div class="right"><div id="rightSlot" class="slot"></div></div>
+    <!-- LEFT -->
+    <section class="zone left">
+      <div class="badgeWrap"><div class="badge">우리업체 70%</div></div>
+      <div class="placeholder" id="phLeft">로딩 중…</div>
+      <img id="imgLeft" alt="" style="display:none;" />
+      <video id="vidLeft" autoplay muted playsinline style="display:none;"></video>
+      <div class="overlay" id="olLeft">🔗 자세히 보기</div>
+    </section>
+
+    <!-- RIGHT -->
+    <section class="zone right">
+      <div class="badgeWrap"><div class="badge">지역소식 30%</div></div>
+      <div class="placeholder" id="phRight">로딩 중…</div>
+      <img id="imgRight" alt="" style="display:none;" />
+      <video id="vidRight" autoplay muted playsinline style="display:none;"></video>
+      <div class="overlay" id="olRight">🔗 자세히 보기</div>
+    </section>
   </div>
 
-  <div id="debug" class="debug"></div>
+  <!-- 진단 패널 -->
+  <div class="hotspot" id="hotspot" tabindex="0" aria-label="진단패널 열기"></div>
+    <div class="netDock" id="netDock" aria-hidden="true"><div class="netBadge" id="netBadge">ONLINE</div></div>
+  
 
-  <script src="./player.js"></script>
+  <div class="diag" id="diag">
+    <h3>진단 패널</h3>
+    <div class="row"><div class="k">온라인</div><div class="v" id="dOnline">-</div></div>
+    <div class="row"><div class="k">TV 상태</div><div class="v" id="dTvStatus">-</div></div>
+    <div class="row"><div class="k">TV 마지막 출석</div><div class="v" id="dTvLastSeen">-</div></div>
+    <div class="row"><div class="k">마지막 업데이트</div><div class="v" id="dUpdate">-</div></div>
+    <div class="row"><div class="k">빌드</div><div class="v" id="dBuild">-</div></div>
+    <div class="row"><div class="k">LEFT 재생</div><div class="v" id="dLeft">-</div></div>
+    <div class="row"><div class="k">RIGHT 재생</div><div class="v" id="dRight">-</div></div>
+    <div class="row"><div class="k">캐시 상태</div><div class="v" id="dCache">-</div></div>
+    <div class="row"><div class="k">에러 횟수</div><div class="v" id="dErr">0</div></div>
+    <div class="row"><div class="k">취침 상태</div><div class="v" id="dSleep">-</div></div>
+    <div class="row"><div class="k">취침 제어</div><div class="v vBtns">
+      <button class="diagbtn" id="btnSleepOpen" type="button">설정</button>
+      <button class="diagbtn" id="btnSleepToggle" type="button">즉시ON</button>
+    </div></div>
+    <div class="row"><div class="k">새로고침</div><div class="v vBtns">
+      <button class="diagbtn" id="btnReload" type="button">새로고침</button>
+    </div></div>
+  </div>
+  <div class="hint">좌상단 5번 터치(또는 리모컨 OK 7번) → 진단 패널 · 우상단 ⛶ → 전체화면</div>
+
+  
+  <!-- 취침(블랙/스크린세이버) 설정 진입: 우하단 핫스팟 -->
+  <div class="sleep-hotspot" id="sleepHotspot" aria-hidden="true"></div>
+
+  <!-- 취침 오버레이 -->
+  <div class="sleep-shield" id="sleepShield" aria-hidden="true">
+    <div class="sleep-saver" id="sleepSaver" aria-hidden="true"></div>
+  </div>
+
+  <!-- 취침 설정 패널 -->
+  <div class="sleep-panel" id="sleepPanel" aria-hidden="true">
+    <div class="sp-head">
+      <div class="sp-title">취침모드 설정</div>
+      <button class="sp-close" id="sleepClose" type="button">닫기</button>
+    </div>
+    <div class="sp-body">
+      <div class="sp-row">
+        <div class="sp-label">선택</div>
+        <button class="sp-btn" id="sleepSelectStart" type="button">시작</button>
+        <button class="sp-btn" id="sleepSelectEnd" type="button">종료</button>
+      </div>
+
+      <div class="sp-row">
+        <div class="sp-label">시작</div>
+        <div class="sp-val" id="sleepStartVal">00:00</div>
+        <div class="sp-label">종료</div>
+        <div class="sp-val" id="sleepEndVal">09:30</div>
+      </div>
+
+      <div class="sp-row">
+        <div class="sp-label">프리셋</div>
+        <button class="sp-btn" id="sleepPresetDefault" type="button">기본</button>
+        <button class="sp-btn" id="sleepPresetNight" type="button">야간</button>
+        <button class="sp-btn" id="sleepPresetOff" type="button">24시간(OFF)</button>
+      </div>
+
+
+      <div class="sp-row sp-adjust">
+        <button class="sp-btn" id="sleepMinusHour" type="button">-1시간</button>
+        <button class="sp-btn" id="sleepMinus10" type="button">-10분</button>
+        <button class="sp-btn" id="sleepPlus10" type="button">+10분</button>
+        <button class="sp-btn" id="sleepPlusHour" type="button">+1시간</button>
+      </div>
+
+      <div class="sp-row">
+        <div class="sp-label">화면</div>
+        <button class="sp-btn" id="sleepModeBlack" type="button">블랙</button>
+        <button class="sp-btn" id="sleepModeSaver" type="button">스크린세이버</button>
+      </div>
+
+      <div class="sp-row sp-foot">
+        <button class="sp-btn" id="sleepReset" type="button">기본값</button>
+        <button class="sp-btn" id="sleepSave" type="button">저장</button>
+      </div>
+
+      <div class="sp-hint">
+        진입: <b>우하단 1초 꾹 누르기</b> (손님이 못 건드리게 숨김)<br/>
+        우선순위: URL 파라미터 &gt; 점주 저장값 &gt; STORE_SLEEP(코드) &gt; 기본값(00:00~09:30)
+      </div>
+    </div>
+  </div>
+
+  <script src="./app.js"></script>
 </body>
 </html>
