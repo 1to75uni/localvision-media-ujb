@@ -1,17 +1,8 @@
-name = "localvision-api-ujb"
+name = "odd-glitter-4464localvision-api-ujb"
 main = "index.js"
 compatibility_date = "2026-02-18"
 
-[[d1_databases]]
-binding = "DB"
-database_name = "localvision-db"
+# Bindings are set in Cloudflare dashboard (recommended):
+# D1 binding name: DB
+# R2 binding name: MEDIA
 
-[[r2_buckets]]
-binding = "MEDIA"
-bucket_name = "localvision-media-ujb"
-
-[vars]
-ONLINE_TTL_SEC = "120"
-# 아래 2개는 Cloudflare Dashboard에서도 같은 값으로 세팅 가능
-# PLAYER_BASE = "https://localvision-media-ujb-player.pages.dev"
-# R2_PUBLIC_BASE = "https://pub-....r2.dev"

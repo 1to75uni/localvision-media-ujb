@@ -267,7 +267,11 @@ async function tvStatus(env, storeId) {
 // -------- HTTP handlers --------
 export default {
   async fetch(req, env) {
-    const { url, path } = parseUrl(req);
+    const { url, path: rawPath } = parseUrl(req);
+    let path = rawPath;
+    // legacy: allow API base to include "/api"
+    if (path === "/api") path = "";
+    if (path.startsWith("/api/")) path = path.slice(4);
     if (req.method === "OPTIONS") return withCors(new Response("", { status: 204 }));
 
     try {
