@@ -285,7 +285,93 @@ export default {
       }
 
       // stores list
-      if (path === "/stores" && req.method === "GET") {
+      
+
+// ------------------------------------------------------------
+// Legacy compatibility routes (for older Player URLs)
+// - /heartbeat (POST)  : alias of /tv/heartbeat
+// - /status (GET)      : alias of /tv/status
+// - /playlist.json     : serve left/right playlist from R2
+// ------------------------------------------------------------
+
+if (path === "/heartbeat" && req.method === "POST") {
+  const body = await safeJson(req);
+  const storeId = safeStoreId(body?.store || body?.storeId || "");
+  if (!storeId) return withCors(json({ ok: false, error: "store is required" }, 400));
+  const ts = await tvHeartbeat(env, storeId);
+  return withCors(json({ ok: true, store: storeId, lastSeen: ts }));
+}
+
+if (path === "/status" && req.method === "GET") {
+  const storeId = safeStoreId(url.searchParams.get("store") || "");
+  if (!storeId) return withCors(json({ ok: false, error: "store is required" }, 400));
+  const st = await tvStatus(env, storeId);
+  // Player expects { online, lastSeen }
+  return withCors(json({ online: st.status === "ONLINE", lastSeen: st.lastSeen }));
+}
+
+if (path === "/playlist.json" && req.method === "GET") {
+  const storeId = safeStoreId(url.searchParams.get("store") || "");
+  const sideRaw = (url.searchParams.get("side") || "left").toLowerCase();
+  const side = sideRaw === "right" ? "right" : "left";
+  if (!storeId) return withCors(json({ ok: false, error: "store is required" }, 400));
+
+  // left  -> stores/<store>/left/playlist.json
+  // right -> prefer stores/<store>/right/playlist.json, fallback to stores/_common/right/playlist.json
+  if (side === "right") {
+    const storeKey = `stores/${storeId}/right/playlist.json`;
+    const storeObj = await env.MEDIA.get(storeKey);
+    if (storeObj) {
+      const txt = await storeObj.text();
+      const payload = (() => { try { return JSON.parse(txt); } catch { return null; } })();
+      const out = (payload && !Array.isArray(payload) && Array.isArray(payload.items)) ? JSON.stringify(payload.items) : txt;
+      return withCors(new Response(out, {
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+        }
+      }));
+    }
+    const commonObj = await env.MEDIA.get(`stores/_common/right/playlist.json`);
+    if (!commonObj) {
+      return withCors(new Response("[]", {
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+        }
+      }));
+    }
+    const txt = await commonObj.text();
+    const payload = (() => { try { return JSON.parse(txt); } catch { return null; } })();
+    const out = (payload && !Array.isArray(payload) && Array.isArray(payload.items)) ? JSON.stringify(payload.items) : txt;
+    return withCors(new Response(out, {
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store",
+      }
+    }));
+  }
+
+  const obj = await env.MEDIA.get(`stores/${storeId}/left/playlist.json`);
+  if (!obj) {
+    return withCors(new Response("[]", {
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store",
+      }
+    }));
+  }
+  const txt = await obj.text();
+  const payload = (() => { try { return JSON.parse(txt); } catch { return null; } })();
+  const out = (payload && !Array.isArray(payload) && Array.isArray(payload.items)) ? JSON.stringify(payload.items) : txt;
+  return withCors(new Response(out, {
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    }
+  }));
+}
+if (path === "/stores" && req.method === "GET") {
         const ids = await listStorePrefixes(env);
         const stores = ids.map((id) => ({ storeId: id, name: id }));
         return withCors(json(stores));
@@ -431,7 +517,7 @@ export default {
         const storeId = safeStoreId(url.searchParams.get("store") || "");
         if (!storeId) return withCors(json({ ok: false, error: "store required" }, 400));
         const st = await tvStatus(env, storeId);
-        return withCors(json({ ok: true, storeId, ...st }));
+  return withCors(json({ online: st.status === "ONLINE", lastSeen: st.lastSeen }));
       }
 
       // 404
