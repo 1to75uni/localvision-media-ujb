@@ -1,208 +1,358 @@
-// Admin V1 - no build
-const API_BASE = (new URLSearchParams(location.search).get("apiBase")) || "https://REPLACE_WITH_YOUR_WORKER_URL";
-const api = (path) => (API_BASE ? API_BASE.replace(/\/$/, '') : '') + path;
+// LocalVision Admin (V3)
+// - 공통 right 타겟(targets) + 전체패널(fullPanel) 설정
+// - Player URL에 apiBase 자동 포함
+// - Player 기본 restart=07:00
 
-const els = {
-  apiBase: document.getElementById('apiBase'),
-  btnRefresh: document.getElementById('btnRefresh'),
-  createForm: document.getElementById('createForm'),
-  name: document.getElementById('name'),
-  storeId: document.getElementById('storeId'),
-  storeList: document.getElementById('storeList'),
-  detail: document.getElementById('detail'),
-  detailSub: document.getElementById('detailSub'),
-  mediaList: document.getElementById('mediaList'),
-  fileInput: document.getElementById('fileInput'),
-  uploadStatus: document.getElementById('uploadStatus'),
-  btnReloadMedia: document.getElementById('btnReloadMedia'),
-  playerUrl: document.getElementById('playerUrl'),
-  btnCopyPlayer: document.getElementById('btnCopyPlayer'),
-  btnShowQR: document.getElementById('btnShowQR'),
-  qrWrap: document.getElementById('qrWrap'),
-  qrCanvas: document.getElementById('qrCanvas'),
-  statusBadge: document.getElementById('statusBadge'),
-  lastSeen: document.getElementById('lastSeen'),
-  btnPing: document.getElementById('btnPing'),
+const $ = (id) => document.getElementById(id);
+
+const state = {
+  apiBase: "",
+  playerBase: "https://localvision-media-ujb-player.pages.dev",
+  r2PublicBase: "",
+  stores: [],
+  selected: null,
 };
 
-els.apiBase.textContent = API_BASE || '(same-origin)';
-
-let currentStore = null;
-
-function fmtTime(ms) {
-  if (!ms) return '-';
-  const d = new Date(ms);
-  return d.toLocaleString();
+function qp(name) {
+  const u = new URL(location.href);
+  return u.searchParams.get(name);
 }
 
-function setStatus(status, lastSeenMs) {
-  els.statusBadge.textContent = status || 'UNKNOWN';
-  els.statusBadge.className = 'px-2 py-1 rounded-lg ' + (status === 'ONLINE' ? 'bg-green-200' : status === 'OFFLINE' ? 'bg-rose-200' : 'bg-slate-200');
-  els.lastSeen.textContent = fmtTime(lastSeenMs);
+function setApiUi(ok) {
+  $("apiDot").className = "status-dot " + (ok ? "online" : "offline");
+  $("apiBaseLabel").textContent = `API: ${state.apiBase || "-"}`;
 }
 
-async function fetchJSON(url, options) {
-  const res = await fetch(url, options);
-  const text = await res.text();
-  let data;
-  try { data = JSON.parse(text); } catch { data = { error: text || 'Invalid JSON' }; }
-  if (!res.ok) throw new Error(data.error || res.statusText);
-  return data;
+function normalizeApiBase(v) {
+  if (!v) return "";
+  v = v.trim();
+  return v.replace(/\/+$/, "");
+}
+
+async function api(path, options = {}) {
+  if (!state.apiBase) throw new Error("apiBase가 비어있어요.");
+  const url = state.apiBase + path;
+  const headers = new Headers(options.headers || {});
+  if (!headers.has("Content-Type") && options.body && !(options.body instanceof FormData)) {
+    headers.set("Content-Type", "application/json");
+  }
+  const res = await fetch(url, { ...options, headers });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`API ${res.status}: ${t || res.statusText}`);
+  }
+  const ct = res.headers.get("content-type") || "";
+  if (ct.includes("application/json")) return await res.json();
+  return await res.text();
+}
+
+function storeApiBase(v) {
+  localStorage.setItem("lv_apiBase", v);
+}
+
+function loadStoredApiBase() {
+  return qp("apiBase") || localStorage.getItem("lv_apiBase") || "";
+}
+
+async function testApi() {
+  try {
+    const meta = await api("/meta");
+    state.playerBase = meta.playerBase || state.playerBase;
+    state.r2PublicBase = meta.r2PublicBase || "";
+    setApiUi(true);
+    return true;
+  } catch (e) {
+    console.error(e);
+    setApiUi(false);
+    return false;
+  }
+}
+
+function safeStoreId(v) {
+  return (v || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function buildPlayerUrl(storeId) {
+  const u = new URL(state.playerBase);
+  u.searchParams.set("store", storeId);
+  u.searchParams.set("apiBase", state.apiBase);
+  // 기본 운영 옵션
+  u.searchParams.set("restart", "07:00");
+  u.searchParams.set("restartMode", "reload");
+  u.searchParams.set("restartJitterSec", "0");
+  u.searchParams.set("cacheMax", "20");
+  return u.toString();
+}
+
+function copy(text) {
+  navigator.clipboard?.writeText(text).catch(() => {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  });
+}
+
+function fmtTs(ts) {
+  if (!ts) return "-";
+  const d = new Date(ts);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function setTvStatus(status, lastSeen) {
+  $("tvStatus").textContent = status || "UNKNOWN";
+  $("tvLastSeen").textContent = lastSeen ? fmtTs(lastSeen) : "-";
+  $("tvDot").className = "status-dot " + (status === "ONLINE" ? "online" : status === "OFFLINE" ? "offline" : "");
 }
 
 async function loadStores() {
-  const data = await fetchJSON(api('/api/stores'));
-  els.storeList.innerHTML = '';
-  data.items.forEach(s => {
-    const li = document.createElement('li');
-    li.className = 'border rounded-xl p-3 hover:bg-slate-50 cursor-pointer';
-    li.innerHTML = `
-      <div class="flex items-center justify-between">
-        <div>
-          <div class="font-semibold">${s.name}</div>
-          <div class="text-xs text-slate-500 font-mono">${s.storeId}</div>
-        </div>
-        <span class="text-xs px-2 py-1 rounded-lg ${s.status === 'ONLINE' ? 'bg-green-200' : s.status === 'OFFLINE' ? 'bg-rose-200' : 'bg-slate-200'}">${s.status || 'UNKNOWN'}</span>
-      </div>
-    `;
-    li.onclick = () => selectStore(s.storeId);
-    els.storeList.appendChild(li);
-  });
+  const stores = await api("/stores");
+  state.stores = stores;
+  renderStores();
+}
+
+function renderStores() {
+  const wrap = $("storesList");
+  wrap.innerHTML = "";
+  if (!state.stores.length) {
+    wrap.innerHTML = `<div class="muted">업체가 없습니다.</div>`;
+    return;
+  }
+  for (const s of state.stores) {
+    const div = document.createElement("div");
+    div.className = "item" + (state.selected?.storeId === s.storeId ? " active" : "");
+    div.innerHTML = `<div class="name">${escapeHtml(s.name || s.storeId)}</div><div class="id mono">${escapeHtml(s.storeId)}</div>`;
+    div.onclick = () => selectStore(s.storeId);
+    wrap.appendChild(div);
+  }
+}
+
+function escapeHtml(v) {
+  return String(v ?? "").replace(/[&<>"']/g, (m) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[m]);
 }
 
 async function selectStore(storeId) {
-  const data = await fetchJSON(api('/api/stores/' + encodeURIComponent(storeId)));
-  currentStore = data.store;
-  els.detailSub.textContent = `${currentStore.name} (${currentStore.storeId})`;
-  els.detail.classList.remove('hidden');
-  els.btnCopyPlayer.classList.remove('hidden');
-  els.btnShowQR.classList.remove('hidden');
-
-  els.playerUrl.textContent = data.playerUrl;
-  els.btnCopyPlayer.onclick = async () => {
-    await navigator.clipboard.writeText(data.playerUrl);
-    alert('복사 완료!');
-  };
-  els.btnShowQR.onclick = async () => {
-    els.qrWrap.classList.toggle('hidden');
-    if (!els.qrWrap.classList.contains('hidden')) {
-      QRCode.toCanvas(els.qrCanvas, data.playerUrl, { width: 220 });
-    }
-  };
-
-  setStatus(data.status?.status, data.status?.lastSeen);
-
-  await loadMedia();
+  state.selected = state.stores.find((x) => x.storeId === storeId) || { storeId };
+  $("storeHint").textContent = `${state.selected.name || storeId} (${storeId})`;
+  $("leftCard").style.display = "";
+  $("statusCard").style.display = "";
+  $("linksCard").style.display = "";
+  $("playerUrl").textContent = buildPlayerUrl(storeId);
+  renderStores();
+  await Promise.all([loadLeftList(), loadStatus()]);
 }
 
-async function loadMedia() {
-  if (!currentStore) return;
-  const data = await fetchJSON(api(`/api/stores/${encodeURIComponent(currentStore.storeId)}/media?side=left`));
-  els.mediaList.innerHTML = '';
-  if (!data.items.length) {
-    els.mediaList.innerHTML = '<div class="text-sm text-slate-500">아직 업로드된 콘텐츠가 없습니다.</div>';
+async function createStore() {
+  const name = $("newName").value.trim();
+  const storeIdRaw = $("newId").value.trim();
+  const storeId = safeStoreId(storeIdRaw);
+  if (!name || !storeId) {
+    alert("업체명 / storeId를 입력해 주세요.");
     return;
   }
-  data.items.forEach(m => {
-    const row = document.createElement('div');
-    row.className = 'border rounded-xl p-3 flex items-center justify-between gap-2';
-    row.innerHTML = `
-      <div>
-        <div class="font-mono text-sm">left_${m.slot}</div>
-        <div class="text-xs text-slate-500">${m.mime}</div>
-      </div>
-      <a class="text-xs px-3 py-2 rounded-xl border" href="${m.url}" target="_blank">열기</a>
-    `;
-    els.mediaList.appendChild(row);
-  });
+  await api("/stores", { method: "POST", body: JSON.stringify({ name, storeId }) });
+  $("newName").value = "";
+  $("newId").value = "";
+  await loadStores();
+  await selectStore(storeId);
 }
 
-async function uploadFileMultipart(file) {
-  // 1) init -> key/uploadId/slot/url
-  els.uploadStatus.textContent = `초기화 중... (${file.name})`;
-  const init = await fetchJSON(api(`/api/stores/${encodeURIComponent(currentStore.storeId)}/upload/init`), {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ side:'left', filename: file.name, mime: file.type || 'application/octet-stream', size: file.size })
-  });
-
-  const { key, uploadId, slot, url } = init;
-  const chunkSize = 10 * 1024 * 1024; // 10MB
-  const totalParts = Math.ceil(file.size / chunkSize);
-
-  const parts = [];
-  for (let partNumber = 1; partNumber <= totalParts; partNumber++) {
-    const start = (partNumber-1) * chunkSize;
-    const end = Math.min(partNumber * chunkSize, file.size);
-    const blob = file.slice(start, end);
-
-    els.uploadStatus.textContent = `업로드 중... left_${slot} (파트 ${partNumber}/${totalParts})`;
-
-    const partRes = await fetch(api(`/api/stores/${encodeURIComponent(currentStore.storeId)}/upload/part?key=${encodeURIComponent(key)}&uploadId=${encodeURIComponent(uploadId)}&partNumber=${partNumber}`), {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: blob
-    });
-    if (!partRes.ok) {
-      const t = await partRes.text();
-      throw new Error(`파트 업로드 실패: ${t}`);
-    }
-    const partJson = await partRes.json();
-    parts.push({ partNumber, etag: partJson.etag });
+async function loadLeftList() {
+  if (!state.selected?.storeId) return;
+  const res = await api(`/stores/${encodeURIComponent(state.selected.storeId)}/left`);
+  const items = res.items || [];
+  const tbody = $("leftList");
+  if (!items.length) {
+    tbody.innerHTML = `<tr><td colspan="2" class="muted">left 콘텐츠가 없습니다.</td></tr>`;
+    return;
   }
-
-  els.uploadStatus.textContent = `완료 처리 중... left_${slot}`;
-  await fetchJSON(api(`/api/stores/${encodeURIComponent(currentStore.storeId)}/upload/complete`), {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ key, uploadId, parts, side:'left', slot, mime: file.type || 'application/octet-stream', url })
-  });
-
-  els.uploadStatus.textContent = `업로드 완료: left_${slot}`;
+  tbody.innerHTML = "";
+  for (const item of items) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="mono">${escapeHtml(item.file)}</td><td class="right"><button class="danger small">삭제</button></td>`;
+    tr.querySelector("button").onclick = async () => {
+      if (!confirm(`${item.file} 삭제할까요?`)) return;
+      await api(`/stores/${encodeURIComponent(state.selected.storeId)}/left/${encodeURIComponent(item.file)}`, { method: "DELETE" });
+      await loadLeftList();
+    };
+    tbody.appendChild(tr);
+  }
 }
 
-els.btnRefresh.onclick = () => loadStores().catch(e => alert(e.message));
+async function uploadLeft() {
+  if (!state.selected?.storeId) return;
+  const f = $("leftUpload").files?.[0];
+  if (!f) return alert("업로드할 파일을 선택해 주세요.");
+  const fd = new FormData();
+  fd.append("file", f, f.name);
+  await api(`/stores/${encodeURIComponent(state.selected.storeId)}/left`, { method: "POST", body: fd });
+  $("leftUpload").value = "";
+  await loadLeftList();
+}
 
-els.createForm.onsubmit = async (e) => {
-  e.preventDefault();
+async function loadStatus() {
+  if (!state.selected?.storeId) return;
   try {
-    const payload = { name: els.name.value.trim(), storeId: els.storeId.value.trim() };
-    await fetchJSON(api('/api/stores'), { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-    els.name.value = ''; els.storeId.value = '';
-    await loadStores();
-  } catch (err) {
-    alert(err.message);
-  }
-};
-
-els.btnReloadMedia.onclick = () => loadMedia().catch(e => alert(e.message));
-
-els.fileInput.onchange = async () => {
-  if (!currentStore) return;
-  const files = Array.from(els.fileInput.files || []);
-  if (!files.length) return;
-  try {
-    for (const f of files) {
-      await uploadFileMultipart(f);
-    }
-    await loadMedia();
-  } catch (err) {
-    alert(err.message);
-  } finally {
-    els.fileInput.value = '';
-  }
-};
-
-els.btnPing.onclick = async () => {
-  if (!currentStore) return;
-  try {
-    const data = await fetchJSON(api(`/api/status?storeId=${encodeURIComponent(currentStore.storeId)}`));
-    setStatus(data.status, data.lastSeen);
-    await loadStores();
+    const s = await api(`/tv/status?store=${encodeURIComponent(state.selected.storeId)}`);
+    setTvStatus(s.status, s.lastSeen);
   } catch (e) {
-    alert(e.message);
+    console.warn(e);
+    setTvStatus("UNKNOWN", null);
   }
-};
+}
 
-// boot
-loadStores().catch(e => alert(e.message));
+function parseTargets(v) {
+  return (v || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+async function loadCommonRightList() {
+  const res = await api("/common/right");
+  const items = res.items || [];
+  const tbody = $("rightList");
+  if (!items.length) {
+    tbody.innerHTML = `<tr><td colspan="5" class="muted">공통 right 콘텐츠가 없습니다.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = "";
+  for (const item of items) {
+    const targetsStr = (item.targets || []).join(",");
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="mono">${escapeHtml(item.file)}<br/><a class="miniLink" href="${escapeHtml(item.url)}" target="_blank" rel="noopener">열기</a></td>
+      <td><input class="targetsInput" type="text" value="${escapeHtml(targetsStr)}" placeholder="ex) goobne,sbflower" /></td>
+      <td class="nowrap"><label class="row" style="gap:8px;justify-content:flex-start"><input type="checkbox" ${item.fullPanel ? "checked" : ""}/> <span class="muted">ON</span></label></td>
+      <td class="nowrap"><button class="small">저장</button></td>
+      <td class="right nowrap"><button class="danger small">삭제</button></td>
+    `;
+
+    const targetsInput = tr.querySelector("input.targetsInput");
+    const fullChk = tr.querySelector("input[type=checkbox]");
+    const saveBtn = tr.querySelectorAll("button")[0];
+    const delBtn = tr.querySelectorAll("button")[1];
+
+    saveBtn.onclick = async () => {
+      const payload = {
+        file: item.file,
+        targets: parseTargets(targetsInput.value),
+        fullPanel: !!fullChk.checked,
+      };
+      await api("/common/right/meta", { method: "PUT", body: JSON.stringify(payload) });
+      await loadCommonRightList();
+      alert("저장됨!");
+    };
+
+    delBtn.onclick = async () => {
+      if (!confirm(`${item.file} 삭제할까요?`)) return;
+      await api(`/common/right/${encodeURIComponent(item.file)}`, { method: "DELETE" });
+      await loadCommonRightList();
+    };
+
+    tbody.appendChild(tr);
+  }
+}
+
+async function uploadCommonRight() {
+  const f = $("rightUpload").files?.[0];
+  if (!f) return alert("업로드할 파일을 선택해 주세요.");
+  const fd = new FormData();
+  fd.append("file", f, f.name);
+  await api(`/common/right`, { method: "POST", body: fd });
+  $("rightUpload").value = "";
+  await loadCommonRightList();
+}
+
+function showQr(url) {
+  const dlg = $("qrDialog");
+  const canvas = $("qrCanvas");
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  window.QRCode.toCanvas(canvas, url, { margin: 1, width: 280 }, (err) => {
+    if (err) console.error(err);
+  });
+  dlg.showModal();
+}
+
+function wire() {
+  $("apiBaseInput").value = state.apiBase;
+
+  $("saveApiBtn").onclick = async () => {
+    state.apiBase = normalizeApiBase($("apiBaseInput").value);
+    if (!state.apiBase) return alert("apiBase를 입력해 주세요.");
+    storeApiBase(state.apiBase);
+    const ok = await testApi();
+    if (!ok) return alert("API 테스트 실패. URL을 확인해 주세요.");
+    await Promise.all([loadStores(), loadCommonRightList()]);
+  };
+
+  $("testApiBtn").onclick = async () => {
+    state.apiBase = normalizeApiBase($("apiBaseInput").value);
+    if (!state.apiBase) return alert("apiBase를 입력해 주세요.");
+    storeApiBase(state.apiBase);
+    const ok = await testApi();
+    alert(ok ? "API OK" : "API 실패");
+  };
+
+  $("refreshStoresBtn").onclick = () => loadStores().catch(alertErr);
+  $("createStoreBtn").onclick = () => createStore().catch(alertErr);
+
+  $("leftRefreshBtn").onclick = () => loadLeftList().catch(alertErr);
+  $("leftUploadBtn").onclick = () => uploadLeft().catch(alertErr);
+
+  $("statusRefreshBtn").onclick = () => loadStatus().catch(alertErr);
+
+  $("copyUrlBtn").onclick = () => {
+    if (!state.selected?.storeId) return;
+    const url = buildPlayerUrl(state.selected.storeId);
+    copy(url);
+    alert("복사됨!");
+  };
+
+  $("showQrBtn").onclick = () => {
+    if (!state.selected?.storeId) return;
+    const url = buildPlayerUrl(state.selected.storeId);
+    showQr(url);
+  };
+
+  $("closeQrBtn").onclick = () => $("qrDialog").close();
+
+  $("rightRefreshBtn").onclick = () => loadCommonRightList().catch(alertErr);
+  $("rightUploadBtn").onclick = () => uploadCommonRight().catch(alertErr);
+}
+
+function alertErr(e) {
+  console.error(e);
+  alert(e?.message || String(e));
+}
+
+async function boot() {
+  state.apiBase = normalizeApiBase(loadStoredApiBase());
+  $("apiBaseInput").value = state.apiBase;
+
+  if (!state.apiBase) {
+    setApiUi(false);
+    return;
+  }
+
+  const ok = await testApi();
+  setApiUi(ok);
+
+  if (ok) {
+    await Promise.all([loadStores(), loadCommonRightList()]);
+  }
+}
+
+wire();
+boot().catch(alertErr);
