@@ -1,261 +1,464 @@
-// Cloudflare Worker API (V1) - No framework
-// Bindings: env.DB (D1), env.MEDIA (R2), env.R2_PUBLIC_BASE, env.RIGHT_PREFIX, env.ONLINE_TTL_SEC
+/**
+ * LocalVision Worker API (V3)
+ * - Admin: store create + left upload/manage
+ * - Common Right: upload/manage + meta(targets/fullPanel)
+ * - TV status: /tv/heartbeat, /tv/status
+ * - Playlist generator: stores/<store>/left/playlist.json + stores/_common/right/playlist.json (R2)
+ */
 
-function json(data, status=200, extraHeaders={}) {
-  const headers = new Headers({
-    'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,PUT,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-    ...extraHeaders,
+const json = (obj, status = 200, headers = {}) =>
+  new Response(JSON.stringify(obj, null, 2), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8", ...headers },
   });
-  return new Response(JSON.stringify(data), { status, headers });
+
+const text = (s, status = 200, headers = {}) =>
+  new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8", ...headers } });
+
+const corsHeaders = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
+  "access-control-allow-headers": "content-type",
+};
+
+function withCors(res) {
+  const h = new Headers(res.headers);
+  for (const [k, v] of Object.entries(corsHeaders)) h.set(k, v);
+  return new Response(res.body, { status: res.status, headers: h });
 }
 
-function err(message, status=400) {
-  return json({ error: message }, status);
+function safeStoreId(v) {
+  return String(v || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
 }
 
-function nowMs(){ return Date.now(); }
-
-function isValidStoreId(id){
-  return /^[a-z0-9][a-z0-9_-]{1,31}$/.test(id);
+function parseUrl(req) {
+  const url = new URL(req.url);
+  const path = url.pathname.replace(/\/+$/, "");
+  return { url, path };
 }
 
-function guessTypeFromMime(mime){
-  return (mime && mime.startsWith('video/')) ? 'video' : 'image';
+function extFromType(type) {
+  if (!type) return "";
+  if (type.includes("mp4")) return "mp4";
+  if (type.includes("png")) return "png";
+  if (type.includes("webp")) return "webp";
+  if (type.includes("jpg") || type.includes("jpeg")) return "jpg";
+  return "bin";
 }
 
-async function getStatus(env, storeId){
-  const row = await env.DB.prepare(
-    'SELECT MAX(last_seen) as last_seen FROM devices WHERE store_id=?'
-  ).bind(storeId).first();
-
-  const lastSeen = row?.last_seen || 0;
-  const ttl = Number(env.ONLINE_TTL_SEC || 120) * 1000;
-  const status = lastSeen && (nowMs() - lastSeen <= ttl) ? 'ONLINE' : 'OFFLINE';
-  return { status, lastSeen };
+function mediaTypeFromKey(key) {
+  const k = String(key || "").toLowerCase();
+  return k.endsWith(".mp4") ? "video" : "image";
 }
 
-function buildPublicUrl(env, objectKey){
-  const base = String(env.R2_PUBLIC_BASE || '').replace(/\/$/, '');
-  return base + '/' + objectKey;
+function guessDurationSecFromKey(key) {
+  // 이미지 기본 10초, 영상은 null(ended 기준)
+  return mediaTypeFromKey(key) === "image" ? 10 : null;
 }
 
-async function listStores(env){
-  const res = await env.DB.prepare('SELECT store_id as storeId, name, created_at as createdAt FROM stores ORDER BY created_at DESC').all();
-  const items = [];
-  for (const s of res.results || []) {
-    const st = await getStatus(env, s.storeId);
-    items.push({ ...s, status: st.status });
+function baseName(key) {
+  const parts = String(key).split("/");
+  return parts[parts.length - 1];
+}
+
+async function ensureTables(env) {
+  // D1: tv_status
+  await env.DB.exec(`
+    CREATE TABLE IF NOT EXISTS tv_status (
+      store_id TEXT PRIMARY KEY,
+      last_seen INTEGER NOT NULL
+    );
+  `);
+}
+
+async function listStorePrefixes(env) {
+  // stores/<store>/left/ 의 prefix 목록
+  const res = await env.MEDIA.list({ prefix: "stores/", delimiter: "/" });
+  const stores = [];
+  for (const p of res.delimitedPrefixes || []) {
+    const m = /^stores\/([^/]+)\/$/.exec(p);
+    if (!m) continue;
+    const id = m[1];
+    if (id) stores.push(id);
   }
-  return items;
+  // _common은 운영용이라 store 목록에서 제외
+  return stores.filter((s) => s !== "_common").sort();
 }
 
-async function getStore(env, storeId){
-  return await env.DB.prepare('SELECT store_id as storeId, name, created_at as createdAt FROM stores WHERE store_id=?')
-    .bind(storeId).first();
+async function ensureStoreFolders(env, storeId) {
+  // R2는 폴더가 없어도 되지만, 목록/가독성을 위해 placeholder를 둠
+  const leftKey = `stores/${storeId}/left/.keep`;
+  const exists = await env.MEDIA.head(leftKey);
+  if (!exists) {
+    await env.MEDIA.put(leftKey, "", { httpMetadata: { contentType: "text/plain" } });
+  }
 }
 
-async function nextSlot(env, storeId, side){
-  const row = await env.DB.prepare('SELECT MAX(slot) as max_slot FROM media WHERE store_id=? AND side=?')
-    .bind(storeId, side).first();
-  const max = row?.max_slot ?? 0;
-  return Number(max) + 1;
+// -------- R2 JSON helpers --------
+async function readJsonFromR2(env, key, fallback) {
+  try {
+    const obj = await env.MEDIA.get(key);
+    if (!obj) return fallback;
+    const txt = await obj.text();
+    return JSON.parse(txt);
+  } catch {
+    return fallback;
+  }
 }
 
-// Multipart Upload helpers using R2 Multipart API
-async function initUpload(env, storeId, side, filename, mime){
-  const slot = await nextSlot(env, storeId, side);
-  const ext = (filename && filename.includes('.')) ? filename.split('.').pop().toLowerCase() : (mime?.split('/')[1] || 'bin');
-  const safeExt = (ext || 'bin').replace(/[^a-z0-9]/g,'').slice(0,10) || 'bin';
-  const objectKey = `stores/${storeId}/${side}/${side}_${slot}.${safeExt}`;
-
-  const mp = await env.MEDIA.createMultipartUpload(objectKey, { httpMetadata: { contentType: mime || 'application/octet-stream' } });
-  const url = buildPublicUrl(env, objectKey);
-  return { slot, key: objectKey, uploadId: mp.uploadId, url };
+async function writeJsonToR2(env, key, value) {
+  await env.MEDIA.put(key, JSON.stringify(value, null, 2), {
+    httpMetadata: { contentType: "application/json" },
+  });
 }
 
-async function uploadPart(env, key, uploadId, partNumber, body){
-  const upload = env.MEDIA.resumeMultipartUpload(key, uploadId);
-  const part = await upload.uploadPart(partNumber, body);
-  // part.etag
-  return { etag: part.etag };
+// -------- Right meta --------
+const RIGHT_META_KEY = "stores/_common/right/meta.json";
+
+function normalizeTargets(v) {
+  if (!v) return [];
+  if (Array.isArray(v)) return v.map(String).map((s) => s.trim()).filter(Boolean);
+  if (typeof v === "string") return v.split(",").map((s) => s.trim()).filter(Boolean);
+  return [];
 }
 
-async function completeUpload(env, key, uploadId, parts){
-  const upload = env.MEDIA.resumeMultipartUpload(key, uploadId);
-  const result = await upload.complete(parts);
-  return result;
+async function loadRightMeta(env) {
+  const meta = await readJsonFromR2(env, RIGHT_META_KEY, { items: [] });
+  if (!meta || !Array.isArray(meta.items)) return { items: [] };
+  // normalize
+  meta.items = meta.items
+    .map((x) => ({
+      file: String(x.file || "").trim(),
+      targets: normalizeTargets(x.targets),
+      fullPanel: !!x.fullPanel,
+      durationSec: Number.isFinite(x.durationSec) ? x.durationSec : undefined,
+    }))
+    .filter((x) => x.file);
+  return meta;
 }
 
-async function recordMedia(env, storeId, side, slot, key, mime, url){
-  await env.DB.prepare(
-    'INSERT INTO media (store_id, side, slot, object_key, mime, url, created_at) VALUES (?,?,?,?,?,?,?)'
-  ).bind(storeId, side, slot, key, mime, url, nowMs()).run();
+async function saveRightMeta(env, meta) {
+  const safe = { items: Array.isArray(meta.items) ? meta.items : [] };
+  await writeJsonToR2(env, RIGHT_META_KEY, safe);
 }
 
-async function listMedia(env, storeId, side){
-  const res = await env.DB.prepare(
-    'SELECT slot, object_key as objectKey, mime, url, created_at as createdAt FROM media WHERE store_id=? AND side=? ORDER BY slot ASC'
-  ).bind(storeId, side).all();
-  return (res.results || []).map(r => ({ ...r, type: guessTypeFromMime(r.mime) }));
-}
+async function syncRightMetaWithKeys(env, rightKeys) {
+  const meta = await loadRightMeta(env);
+  const files = rightKeys.map(baseName);
+  const byFile = new Map(meta.items.map((x) => [x.file, x]));
 
-async function playerConfig(env, storeId){
-  const left = await listMedia(env, storeId, 'left');
-  // right는 공통 prefix에서 playlist를 DB가 아니라 "하드코딩"으로 가져오거나, 추후 DB로 확장
-  // V1: right는 비워둠 (원하면 right도 같은 방식으로 확장)
-  const right = [];
-  return { left, right };
-}
-
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    if (request.method === 'OPTIONS') {
-      return new Response('', { status: 204, headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET,POST,PUT,OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
-      }});
+  // add missing
+  for (const f of files) {
+    if (!byFile.has(f)) {
+      byFile.set(f, { file: f, targets: [], fullPanel: false });
     }
+  }
+
+  // remove stale
+  for (const f of Array.from(byFile.keys())) {
+    if (!files.includes(f)) byFile.delete(f);
+  }
+
+  meta.items = Array.from(byFile.values()).sort((a, b) => a.file.localeCompare(b.file));
+  await saveRightMeta(env, meta);
+  return meta;
+}
+
+function metaForFile(meta, file) {
+  const it = meta?.items?.find((x) => x.file === file);
+  return it || { targets: [], fullPanel: false };
+}
+
+// -------- Playlist generator --------
+async function listMediaKeys(env, storeId, side) {
+  const prefix = `stores/${storeId}/${side}/`;
+  const res = await env.MEDIA.list({ prefix });
+  const out = [];
+  for (const obj of res.objects || []) {
+    if (!obj.key) continue;
+    if (obj.key.endsWith(".keep")) continue;
+    if (obj.key.endsWith("/playlist.json")) continue;
+    if (obj.key.endsWith("/meta.json")) continue;
+    if (!/\.(mp4|jpg|jpeg|png|webp)$/i.test(obj.key)) continue;
+    out.push(obj.key);
+  }
+  // left_1, left_2 ... 정렬 / right_1 ... 정렬
+  out.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  return out;
+}
+
+async function writePlaylist(env, key, items) {
+  const payload = { updatedAt: Date.now(), items };
+  await writeJsonToR2(env, key, payload);
+}
+
+async function refreshPlaylists(env, storeId) {
+  // left
+  const leftKeys = await listMediaKeys(env, storeId, "left");
+  const leftItems = leftKeys.map((k) => ({
+    url: `${env.R2_PUBLIC_BASE}/${k}`,
+    key: k,
+    type: mediaTypeFromKey(k),
+    durationSec: guessDurationSecFromKey(k),
+  }));
+  await writePlaylist(env, `stores/${storeId}/left/playlist.json`, leftItems);
+
+  // right(common)
+  const rightKeys = await listMediaKeys(env, "_common", "right");
+  const meta = await syncRightMetaWithKeys(env, rightKeys);
+
+  const rightItems = rightKeys.map((k) => {
+    const file = baseName(k);
+    const m = metaForFile(meta, file);
+    return {
+      url: `${env.R2_PUBLIC_BASE}/${k}`,
+      key: k,
+      file,
+      type: mediaTypeFromKey(k),
+      durationSec: Number.isFinite(m.durationSec) ? m.durationSec : guessDurationSecFromKey(k),
+      targets: m.targets || [],
+      fullPanel: !!m.fullPanel,
+    };
+  });
+  await writePlaylist(env, `stores/_common/right/playlist.json`, rightItems);
+}
+
+async function nextSlot(env, storeId, side) {
+  // left_1, left_2 ... or right_1...
+  const keys = await listMediaKeys(env, storeId, side);
+  const prefix = side === "left" ? "left_" : "right_";
+  let max = 0;
+  for (const k of keys) {
+    const f = baseName(k);
+    const m = new RegExp(`^${prefix}(\\d+)\\.`).exec(f);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (n > max) max = n;
+    }
+  }
+  return max + 1;
+}
+
+// -------- TV status --------
+async function tvHeartbeat(env, storeId) {
+  await ensureTables(env);
+  const now = Date.now();
+  await env.DB.prepare(`INSERT INTO tv_status(store_id,last_seen) VALUES(?,?)
+    ON CONFLICT(store_id) DO UPDATE SET last_seen=excluded.last_seen`)
+    .bind(storeId, now)
+    .run();
+  return now;
+}
+
+async function tvStatus(env, storeId) {
+  await ensureTables(env);
+  const row = await env.DB.prepare(`SELECT store_id,last_seen FROM tv_status WHERE store_id=?`).bind(storeId).first();
+  const last = row?.last_seen || null;
+  const ttl = parseInt(env.ONLINE_TTL_SEC || "120", 10) || 120;
+  const now = Date.now();
+  let status = "UNKNOWN";
+  if (last) status = (now - last <= ttl * 1000) ? "ONLINE" : "OFFLINE";
+  return { status, lastSeen: last };
+}
+
+// -------- HTTP handlers --------
+export default {
+  async fetch(req, env) {
+    const { url, path } = parseUrl(req);
+    if (req.method === "OPTIONS") return withCors(new Response("", { status: 204 }));
 
     try {
-      // Routes
-      if (url.pathname === '/api/stores' && request.method === 'GET') {
-        const items = await listStores(env);
-        return json({ items });
+      // health
+      if (path === "" || path === "/") return withCors(text("ok"));
+
+      // meta (admin/player가 base 얻을 때)
+      if (path === "/meta" && req.method === "GET") {
+        return withCors(json({
+          ok: true,
+          r2PublicBase: env.R2_PUBLIC_BASE,
+          playerBase: env.PLAYER_BASE,
+          onlineTtlSec: parseInt(env.ONLINE_TTL_SEC || "120", 10) || 120,
+        }));
       }
 
-      if (url.pathname === '/api/stores' && request.method === 'POST') {
-        const body = await request.json();
-        const name = String(body.name || '').trim();
-        const storeId = String(body.storeId || '').trim();
-        if (!name) return err('name required');
-        if (!isValidStoreId(storeId)) return err('storeId invalid (lowercase a-z0-9_-), 2~32 chars');
-        const exists = await getStore(env, storeId);
-        if (exists) return err('storeId already exists', 409);
-
-        await env.DB.prepare('INSERT INTO stores (store_id, name, created_at) VALUES (?,?,?)')
-          .bind(storeId, name, nowMs()).run();
-        return json({ ok: true });
+      // stores list
+      if (path === "/stores" && req.method === "GET") {
+        const ids = await listStorePrefixes(env);
+        const stores = ids.map((id) => ({ storeId: id, name: id }));
+        return withCors(json(stores));
       }
 
-      // /api/stores/:storeId
-      const mStore = url.pathname.match(/^\/api\/stores\/([a-z0-9_-]+)$/);
-      if (mStore && request.method === 'GET') {
-        const storeId = mStore[1];
-        const store = await getStore(env, storeId);
-        if (!store) return err('store not found', 404);
-        const status = await getStatus(env, storeId);
-        let base = env.PLAYER_BASE || 'https://YOUR_PLAYER_PAGES_DOMAIN';
-        base = String(base).replace(/\/$/, '');
-        const sep = base.includes('?') ? '&' : '?';
-        const playerUrl = `${base}${sep}store=${encodeURIComponent(storeId)}`;
-        return json({ store, status, playerUrl });
+      // create store
+      if (path === "/stores" && req.method === "POST") {
+        const body = await req.json().catch(() => ({}));
+        const storeId = safeStoreId(body.storeId);
+        const name = String(body.name || storeId);
+        if (!storeId) return withCors(json({ ok: false, error: "invalid storeId" }, 400));
+        await ensureStoreFolders(env, storeId);
+        await refreshPlaylists(env, storeId);
+        return withCors(json({ ok: true, storeId, name }));
       }
 
-      const mMedia = url.pathname.match(/^\/api\/stores\/([a-z0-9_-]+)\/media$/);
-      if (mMedia && request.method === 'GET') {
-        const storeId = mMedia[1];
-        const side = url.searchParams.get('side') || 'left';
-        const store = await getStore(env, storeId);
-        if (!store) return err('store not found', 404);
-        const items = await listMedia(env, storeId, side);
-        return json({ items });
+      // left list
+      if (path.startsWith("/stores/") && path.endsWith("/left") && req.method === "GET") {
+        const storeId = path.split("/")[2];
+        const keys = await listMediaKeys(env, storeId, "left");
+        const items = keys.map((k) => ({
+          key: k,
+          file: baseName(k),
+          url: `${env.R2_PUBLIC_BASE}/${k}`,
+          type: mediaTypeFromKey(k),
+        }));
+        return withCors(json({ ok: true, items }));
       }
 
-      // Upload init/part/complete
-      const mInit = url.pathname.match(/^\/api\/stores\/([a-z0-9_-]+)\/upload\/init$/);
-      if (mInit && request.method === 'POST') {
-        const storeId = mInit[1];
-        const store = await getStore(env, storeId);
-        if (!store) return err('store not found', 404);
+      // left upload
+      if (path.startsWith("/stores/") && path.endsWith("/left") && req.method === "POST") {
+        const storeId = path.split("/")[2];
+        const form = await req.formData();
+        const file = form.get("file");
+        if (!(file instanceof File)) return withCors(json({ ok: false, error: "file required" }, 400));
 
-        const body = await request.json();
-        const side = String(body.side || 'left');
-        const filename = String(body.filename || 'file.bin');
-        const mime = String(body.mime || 'application/octet-stream');
+        const slot = await nextSlot(env, storeId, "left");
+        const ext = extFromType(file.type) || "bin";
+        const key = `stores/${storeId}/left/left_${slot}.${ext}`;
+        await env.MEDIA.put(key, await file.arrayBuffer(), { httpMetadata: { contentType: file.type } });
 
-        const init = await initUpload(env, storeId, side, filename, mime);
-        return json(init);
+        await refreshPlaylists(env, storeId);
+        return withCors(json({ ok: true, key }));
       }
 
-      const mPart = url.pathname.match(/^\/api\/stores\/([a-z0-9_-]+)\/upload\/part$/);
-      if (mPart && request.method === 'PUT') {
-        const key = url.searchParams.get('key');
-        const uploadId = url.searchParams.get('uploadId');
-        const partNumber = Number(url.searchParams.get('partNumber') || '0');
-        if (!key || !uploadId || !partNumber) return err('missing key/uploadId/partNumber');
-        const body = request.body; // ReadableStream
-        const res = await uploadPart(env, key, uploadId, partNumber, body);
-        return json(res);
+      // left delete
+      if (path.startsWith("/stores/") && path.includes("/left/") && req.method === "DELETE") {
+        const [, , storeId, , fileName] = path.split("/"); // /stores/:id/left/:file
+        if (!storeId || !fileName) return withCors(json({ ok: false }, 400));
+        const key = `stores/${storeId}/left/${fileName}`;
+        await env.MEDIA.delete(key);
+        await refreshPlaylists(env, storeId);
+        return withCors(json({ ok: true }));
       }
 
-      const mComplete = url.pathname.match(/^\/api\/stores\/([a-z0-9_-]+)\/upload\/complete$/);
-      if (mComplete && request.method === 'POST') {
-        const storeId = mComplete[1];
-        const store = await getStore(env, storeId);
-        if (!store) return err('store not found', 404);
-
-        const body = await request.json();
-        const key = String(body.key || '');
-        const uploadId = String(body.uploadId || '');
-        const parts = body.parts || [];
-        const side = String(body.side || 'left');
-        const slot = Number(body.slot || 0);
-        const mime = String(body.mime || 'application/octet-stream');
-        const urlPublic = String(body.url || buildPublicUrl(env, key));
-
-        if (!key || !uploadId || !Array.isArray(parts) || !slot) return err('missing key/uploadId/parts/slot');
-        const formattedParts = parts.map(p => ({ partNumber: Number(p.partNumber), etag: String(p.etag) }));
-        await completeUpload(env, key, uploadId, formattedParts);
-        await recordMedia(env, storeId, side, slot, key, mime, urlPublic);
-        return json({ ok: true });
+      // common right list
+      if (path === "/common/right" && req.method === "GET") {
+        const keys = await listMediaKeys(env, "_common", "right");
+        const meta = await syncRightMetaWithKeys(env, keys);
+        const items = keys.map((k) => {
+          const file = baseName(k);
+          const m = metaForFile(meta, file);
+          return {
+            key: k,
+            file,
+            url: `${env.R2_PUBLIC_BASE}/${k}`,
+            type: mediaTypeFromKey(k),
+            targets: m.targets || [],
+            fullPanel: !!m.fullPanel,
+          };
+        });
+        return withCors(json({ ok: true, items }));
       }
 
-      // Player config
-      if (url.pathname === '/api/player/config' && request.method === 'GET') {
-        const storeId = url.searchParams.get('storeId');
-        if (!storeId) return err('storeId required');
-        const store = await getStore(env, storeId);
-        if (!store) return err('store not found', 404);
-        const cfg = await playerConfig(env, storeId);
-        return json(cfg);
+      // common right upload
+      if (path === "/common/right" && req.method === "POST") {
+        const form = await req.formData();
+        const file = form.get("file");
+        if (!(file instanceof File)) return withCors(json({ ok: false, error: "file required" }, 400));
+
+        const slot = await nextSlot(env, "_common", "right");
+        const ext = extFromType(file.type) || "bin";
+        const key = `stores/_common/right/right_${slot}.${ext}`;
+        await env.MEDIA.put(key, await file.arrayBuffer(), { httpMetadata: { contentType: file.type } });
+
+        // meta에 추가(없으면)
+        const meta = await loadRightMeta(env);
+        const f = baseName(key);
+        if (!meta.items.find((x) => x.file === f)) meta.items.push({ file: f, targets: [], fullPanel: false });
+        await saveRightMeta(env, meta);
+
+        await refreshCommonRightOnly(env);
+
+        return withCors(json({ ok: true, key }));
       }
 
-      // Heartbeat
-      if (url.pathname === '/api/heartbeat' && request.method === 'POST') {
-        const body = await request.json();
-        const storeId = String(body.storeId || '');
-        const deviceId = String(body.deviceId || '');
-        const role = String(body.role || 'tv');
-        if (!storeId || !deviceId) return err('storeId/deviceId required');
-        const store = await getStore(env, storeId);
-        if (!store) return err('store not found', 404);
+      // common right meta update
+      if (path === "/common/right/meta" && req.method === "PUT") {
+        const body = await req.json().catch(() => ({}));
+        const file = String(body.file || "").trim();
+        if (!file) return withCors(json({ ok: false, error: "file required" }, 400));
 
-        const ua = String(body.ua || '');
-        const ip = request.headers.get('CF-Connecting-IP') || '';
-        await env.DB.prepare(
-          'INSERT INTO devices (device_id, store_id, role, ua, ip, last_seen) VALUES (?,?,?,?,?,?) ' +
-          'ON CONFLICT(device_id) DO UPDATE SET store_id=excluded.store_id, role=excluded.role, ua=excluded.ua, ip=excluded.ip, last_seen=excluded.last_seen'
-        ).bind(deviceId, storeId, role, ua, ip, nowMs()).run();
+        const targets = normalizeTargets(body.targets);
+        const fullPanel = !!body.fullPanel;
+        const meta = await loadRightMeta(env);
+        const it = meta.items.find((x) => x.file === file);
+        if (!it) return withCors(json({ ok: false, error: "file not found" }, 404));
 
-        return json({ ok:true });
+        it.targets = targets;
+        it.fullPanel = fullPanel;
+        await saveRightMeta(env, meta);
+        await refreshCommonRightOnly(env);
+
+        return withCors(json({ ok: true }));
       }
 
-      if (url.pathname === '/api/status' && request.method === 'GET') {
-        const storeId = url.searchParams.get('storeId');
-        if (!storeId) return err('storeId required');
-        const st = await getStatus(env, storeId);
-        return json(st);
+      // common right delete
+      if (path.startsWith("/common/right/") && req.method === "DELETE") {
+        const fileName = decodeURIComponent(path.split("/")[3] || "");
+        if (!fileName) return withCors(json({ ok: false }, 400));
+        const key = `stores/_common/right/${fileName}`;
+        await env.MEDIA.delete(key);
+
+        const meta = await loadRightMeta(env);
+        meta.items = meta.items.filter((x) => x.file !== fileName);
+        await saveRightMeta(env, meta);
+
+        await refreshCommonRightOnly(env);
+        return withCors(json({ ok: true }));
       }
 
-      return err('not found', 404);
+      // tv heartbeat
+      if (path === "/tv/heartbeat" && req.method === "POST") {
+        const body = await req.json().catch(() => ({}));
+        const storeId = safeStoreId(body.store || body.storeId);
+        if (!storeId) return withCors(json({ ok: false, error: "store required" }, 400));
+        const ts = await tvHeartbeat(env, storeId);
+        return withCors(json({ ok: true, storeId, lastSeen: ts }));
+      }
+
+      // tv status
+      if (path === "/tv/status" && req.method === "GET") {
+        const storeId = safeStoreId(url.searchParams.get("store") || "");
+        if (!storeId) return withCors(json({ ok: false, error: "store required" }, 400));
+        const st = await tvStatus(env, storeId);
+        return withCors(json({ ok: true, storeId, ...st }));
+      }
+
+      // 404
+      return withCors(json({ ok: false, error: "not found" }, 404));
     } catch (e) {
-      return err(e.message || String(e), 500);
+      return withCors(json({ ok: false, error: e.message || String(e) }, 500));
     }
-  }
+
+    // ---- local helpers for this fetch ----
+    async function refreshCommonRightOnly(env) {
+      const rightKeys = await listMediaKeys(env, "_common", "right");
+      const meta = await syncRightMetaWithKeys(env, rightKeys);
+      const rightItems = rightKeys.map((k) => {
+        const file = baseName(k);
+        const m = metaForFile(meta, file);
+        return {
+          url: `${env.R2_PUBLIC_BASE}/${k}`,
+          key: k,
+          file,
+          type: mediaTypeFromKey(k),
+          durationSec: Number.isFinite(m.durationSec) ? m.durationSec : guessDurationSecFromKey(k),
+          targets: m.targets || [],
+          fullPanel: !!m.fullPanel,
+        };
+      });
+      await writePlaylist(env, `stores/_common/right/playlist.json`, rightItems);
+    }
+
+  },
 };
